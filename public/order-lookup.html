@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Order Lookup — Detective Hawk Games</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: #ffffff;
+      color: #333333;
+    }
+
+    .lookup-container {
+      max-width: 540px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+
+    h1 {
+      font-size: 28px;
+      font-weight: bold;
+      margin-bottom: 8px;
+      color: #1a1a1a;
+    }
+
+    .subtitle {
+      font-size: 15px;
+      color: #555555;
+      margin-bottom: 32px;
+    }
+
+    .form-card {
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 28px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: #333;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid #cccccc;
+      border-radius: 6px;
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input:focus {
+      border-color: #3aacb5;
+    }
+
+    .btn-find {
+      width: 100%;
+      padding: 13px;
+      background: #1a0a2e;
+      color: #ffffff;
+      border: none;
+      border-radius: 6px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .btn-find:hover { background: #2d1a4e; }
+    .btn-find:disabled { background: #888; cursor: not-allowed; }
+
+    .result-card {
+      margin-top: 28px;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 24px;
+      display: none;
+    }
+
+    .result-card.visible { display: block; }
+
+    .order-number {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 4px;
+    }
+
+    .status-badge {
+      display: inline-block;
+      background: #1a0a2e;
+      color: #ffffff;
+      padding: 5px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+
+    .status-desc {
+      font-size: 14px;
+      color: #444;
+      margin-bottom: 20px;
+      line-height: 1.5;
+    }
+
+    .items-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+    }
+
+    .item-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 14px;
+      padding: 6px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+
+    .item-row:last-child { border-bottom: none; }
+    .item-qty { color: #888; }
+
+    .error-msg {
+      margin-top: 16px;
+      padding: 12px 16px;
+      background: #fff0f0;
+      border: 1px solid #ffcccc;
+      border-radius: 6px;
+      color: #c0392b;
+      font-size: 14px;
+      display: none;
+    }
+
+    .error-msg.visible { display: block; }
+
+    .loading { display: none; text-align: center; color: #888; margin-top: 16px; font-size: 14px; }
+    .loading.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div class="lookup-container">
+    <h1>Order Lookup</h1>
+    <p class="subtitle">Want to find the status of your order? Please use this form.</p>
+
+    <div class="form-card">
+      <div class="form-group">
+        <label for="orderNumber">Order Number</label>
+        <input type="text" id="orderNumber" placeholder="e.g. 5165" />
+      </div>
+      <div class="form-group">
+        <label for="email">Email or Phone</label>
+        <input type="text" id="email" placeholder="Email address used at checkout" />
+      </div>
+      <button class="btn-find" id="findBtn" onclick="findOrder()">Find Order</button>
+    </div>
+
+    <div class="loading" id="loading">Looking up your order...</div>
+    <div class="error-msg" id="errorMsg"></div>
+
+    <div class="result-card" id="resultCard">
+      <div class="order-number" id="resultOrderNum"></div>
+      <div class="status-badge" id="resultStatus"></div>
+      <div class="status-desc" id="resultDesc"></div>
+      <div class="items-title">Items in your order</div>
+      <div id="resultItems"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_URL = 'https://dhg-automation.vercel.app/api/order-lookup';
+
+    async function findOrder() {
+      const orderNumber = document.getElementById('orderNumber').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const btn = document.getElementById('findBtn');
+      const loading = document.getElementById('loading');
+      const errorMsg = document.getElementById('errorMsg');
+      const resultCard = document.getElementById('resultCard');
+
+      if (!orderNumber || !email) {
+        showError('Please enter both your order number and email address.');
+        return;
+      }
+
+      // Reset UI
+      errorMsg.classList.remove('visible');
+      resultCard.classList.remove('visible');
+      loading.classList.add('visible');
+      btn.disabled = true;
+
+      try {
+        const res = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orderNumber, email }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          showError(data.error || 'Something went wrong. Please try again.');
+          return;
+        }
+
+        // Populate result card
+        document.getElementById('resultOrderNum').textContent = `Order ${data.orderNumber}`;
+        document.getElementById('resultStatus').textContent = data.status;
+        document.getElementById('resultDesc').textContent = data.statusDescription;
+
+        const itemsEl = document.getElementById('resultItems');
+        itemsEl.innerHTML = data.items.map(item => `
+          <div class="item-row">
+            <span>${item.title}</span>
+            <span class="item-qty">×${item.quantity}</span>
+          </div>
+        `).join('');
+
+        resultCard.classList.add('visible');
+
+      } catch (err) {
+        showError('Unable to connect. Please try again in a moment.');
+      } finally {
+        loading.classList.remove('visible');
+        btn.disabled = false;
+      }
+    }
+
+    function showError(msg) {
+      const errorMsg = document.getElementById('errorMsg');
+      errorMsg.textContent = msg;
+      errorMsg.classList.add('visible');
+    }
+
+    // Allow Enter key to submit
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter') findOrder();
+    });
+  </script>
+</body>
+</html>

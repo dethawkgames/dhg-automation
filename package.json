@@ -1,0 +1,12 @@
+{
+  "name": "dhg-automation",
+  "version": "1.0.0",
+  "description": "Detective Hawk Games order automation",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
