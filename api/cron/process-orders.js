@@ -66,7 +66,7 @@ async function getUntaggedOrders() {
               customer {
                 id firstName numberOfOrders
                 orders(first: 50) {
-                  edges { node { id fulfillmentStatus } }
+                  edges { node { id displayFulfillmentStatus } }
                 }
               }
               lineItems(first: 50) {
@@ -128,7 +128,7 @@ function isFirstTimeCustomer(order) {
 function isFirstShipment(order) {
   if (!order.customer) return true;
   return !order.customer.orders.edges.some(
-    e => e.node.id !== order.id && e.node.fulfillmentStatus === 'FULFILLED'
+    e => e.node.id !== order.id && e.node.displayFulfillmentStatus === "FULFILLED"
   );
 }
 
