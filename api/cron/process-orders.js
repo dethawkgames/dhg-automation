@@ -143,7 +143,7 @@ function determineStatus(order) {
 
 // ── Email templates ────────────────────────────────────────────────────────
 function baseTemplate(content) {
-  const LOGO = 'https://detectivehawkgames.com/cdn/shop/files/DHG_Logo.png';
+  const LOGO = 'https://detectivehawkgames.com/cdn/shop/files/Text_Logo_002_280x.png?v=1670109213';
   const ADDR = 'Detective Hawk Games, 109 Ambersweet Way, Davenport FL 33897';
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     body{margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif}
