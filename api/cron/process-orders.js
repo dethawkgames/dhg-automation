@@ -74,6 +74,7 @@ async function getUntaggedOrders() {
                   node {
                     title quantity
                     product {
+                      id
                       metafield(namespace: "custom", key: "release_date") { value }
                     }
                   }
@@ -132,8 +133,62 @@ function isFirstShipment(order) {
   );
 }
 
-function determineStatus(order) {
+// ── Bin tracker check ────────────────────────────────────────────────────────
+const BIN_TRACKER_URL = 'https://dhg-bin-tracker-app.vercel.app';
+
+async function getBinQuantities() {
+  const res = await fetch(`${BIN_TRACKER_URL}/api/bins`);
+  if (!res.ok) throw new Error(`Bin tracker fetch failed: ${res.status}`);
+  const data = await res.json();
+  const bins = data.bins || data;
+
+  // Aggregate total quantity per productId across all bins/shelf
+  const totals = new Map();
+  for (const items of Object.values(bins)) {
+    for (const item of items) {
+      totals.set(item.productId, (totals.get(item.productId) || 0) + item.quantity);
+    }
+  }
+  return totals;
+}
+
+// Checks if every line item's required quantity is covered by remaining bin stock.
+// Does NOT mutate availableQty - caller decides whether to commit the deduction.
+function allItemsCoveredByBins(order, availableQty) {
+  for (const edge of order.lineItems.edges) {
+    const item = edge.node;
+    const productId = item.product?.id;
+    if (!productId) return false;
+    const have = availableQty.get(productId) || 0;
+    if (have < item.quantity) return false;
+  }
+  return true;
+}
+
+// Deducts this order's line items from the running availability map (call only after confirming coverage)
+function deductFromBins(order, availableQty) {
+  for (const edge of order.lineItems.edges) {
+    const item = edge.node;
+    const productId = item.product?.id;
+    availableQty.set(productId, (availableQty.get(productId) || 0) - item.quantity);
+  }
+}
+
+// IMPORTANT: orders must be processed oldest-first so that when bin stock is limited,
+// the order that's been waiting longest gets priority for inventory-queued status,
+// not whichever order happens to come first in API pagination order.
+function sortOldestFirst(orders) {
+  return [...orders].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+function determineStatus(order, availableQty) {
   if (hasPreorderItem(order)) return { status: 'preorder', sendEmail: true };
+
+  if (allItemsCoveredByBins(order, availableQty)) {
+    deductFromBins(order, availableQty);
+    return { status: 'inventory-queued', sendEmail: true };
+  }
+
   if (isFirstTimeCustomer(order)) {
     const isShop = order.channelInformation?.channelDefinition?.handle === 'shop';
     return { status: isShop ? 'shop-first-order' : 'store-first-order', sendEmail: true };
@@ -304,14 +359,21 @@ export default async function handler(req, res) {
     const orders = await getUntaggedOrders();
     console.log(`Found ${orders.length} untagged orders`);
 
+    const sortedOrders = sortOldestFirst(orders);
+    const availableQty = await getBinQuantities();
+    const dryRun = req.query.dryRun === '1';
+
     const results = [];
-    for (const order of orders) {
+    for (const order of sortedOrders) {
       try {
-        const { status, sendEmail: shouldEmail } = determineStatus(order);
-        await tagOrder(order.id, status, order.tags);
+        const { status, sendEmail: shouldEmail } = determineStatus(order, availableQty);
+
+        if (!dryRun) {
+          await tagOrder(order.id, status, order.tags);
+        }
 
         let emailResult = { skipped: true };
-        if (shouldEmail && order.email) {
+        if (shouldEmail && order.email && !dryRun) {
           emailResult = await sendEmail(status, {
             email: order.email,
             firstName: order.customer?.firstName || '',
