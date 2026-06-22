@@ -9,4 +9,7 @@
   "scripts": {
     "dev": "vercel dev"
   }
+"dependencies": {
+"jsonwebtoken": "^9.0.2"
+}
 }
