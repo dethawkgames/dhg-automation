@@ -9,6 +9,103 @@ const FROM_EMAIL = 'hello@detectivehawkgames.com';
 const FROM_NAME = 'Detective Hawk Games';
 const ORDER_LOOKUP_URL = 'https://detectivehawkgames.com/pages/order-lookup';
 const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+const AGG_SHEET_ID = '1rsUU7qZJZGhivsofBiFPa7FK6qnHosrxps10NYzLxAE';
+const EMAIL_HISTORY_RANGE = "'Email History'!A2:B1000";
+
+const GOOGLE_SA_EMAIL_VAR = () => process.env.GOOGLE_SA_EMAIL;
+const GOOGLE_SA_PRIVATE_KEY_VAR = () => {
+  const raw = process.env.GOOGLE_SA_PRIVATE_KEY_B64 || process.env.GOOGLE_SA_PRIVATE_KEY || '';
+  if (process.env.GOOGLE_SA_PRIVATE_KEY_B64) {
+    return Buffer.from(raw, 'base64').toString('utf8');
+  }
+  return raw.replace(/\\n/g, '\n');
+};
+
+// ── Google Sheets auth + access (for Email History tracking) ───────────────
+async function getGoogleToken() {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default;
+  const token = jwt.sign(
+    { scope: 'https://www.googleapis.com/auth/spreadsheets' },
+    GOOGLE_SA_PRIVATE_KEY_VAR(),
+    {
+      algorithm: 'RS256',
+      issuer: GOOGLE_SA_EMAIL_VAR(),
+      audience: 'https://oauth2.googleapis.com/token',
+      expiresIn: '1h',
+    }
+  );
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: token,
+    }),
+  });
+  if (!res.ok) throw new Error(`Google token request failed: ${res.status}`);
+  const { access_token } = await res.json();
+  return access_token;
+}
+
+async function sheetsGet(range) {
+  const token = await getGoogleToken();
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}/values/${encodeURIComponent(range)}`,
+    { headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Sheets GET failed: ${res.status}`);
+  const data = await res.json();
+  return data.values || [];
+}
+
+async function sheetsPut(range, values) {
+  const token = await getGoogleToken();
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`,
+    {
+      method: 'PUT',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values }),
+    }
+  );
+  if (!res.ok) throw new Error(`Sheets PUT failed: ${res.status} ${await res.text()}`);
+}
+
+async function sheetsClear(range) {
+  const token = await getGoogleToken();
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}/values/${encodeURIComponent(range)}:clear`,
+    { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Sheets clear failed: ${res.status}`);
+}
+
+// Loads the full Email History as a Map: orderName -> Set of statuses already emailed
+async function loadEmailHistory() {
+  const rows = await sheetsGet(EMAIL_HISTORY_RANGE);
+  const history = new Map();
+  for (const row of rows) {
+    const orderName = row[0];
+    if (!orderName) continue;
+    const statuses = (row[1] || '').split(',').map(s => s.trim()).filter(Boolean);
+    history.set(orderName, new Set(statuses));
+  }
+  return history;
+}
+
+// Rewrites the entire Email History tab from the in-memory map.
+// Safe because the cron loads the full history, mutates it, then writes it all back
+// in one pass - no concurrent writers expected (single cron, no overlapping runs).
+async function saveEmailHistory(history) {
+  const rows = [...history.entries()]
+    .filter(([, statuses]) => statuses.size > 0)
+    .map(([orderName, statuses]) => [orderName, [...statuses].join(', ')]);
+  await sheetsClear(EMAIL_HISTORY_RANGE);
+  if (rows.length) await sheetsPut(`'Email History'!A2:B${rows.length + 1}`, rows);
+}
 
 // ── Shopify token ──────────────────────────────────────────────────────────
 let _token = null;
@@ -45,9 +142,9 @@ async function graphql(query, variables = {}) {
   return data;
 }
 
-// ── Fetch untagged orders ──────────────────────────────────────────────────
-async function getUntaggedOrders() {
-  const since = new Date(Date.now() - 48 * 60 * 60 * 1000);
+// ── Fetch orders in scope: unfulfilled, created in the last 30 days ────────
+async function getOrdersInScope() {
+  const since = new Date(Date.now() - THIRTY_DAYS_MS);
   const sinceStr = since.toISOString().split('T')[0];
 
   let orders = [];
@@ -84,7 +181,7 @@ async function getUntaggedOrders() {
           }
         }
       }
-    `, { query: `created_at:>=${sinceStr}`, cursor });
+    `, { query: `fulfillment_status:unfulfilled created_at:>=${sinceStr}`, cursor });
 
     const page = data.orders;
     orders = orders.concat(page.edges.map(e => e.node));
@@ -92,7 +189,20 @@ async function getUntaggedOrders() {
     cursor = page.pageInfo.endCursor;
   }
 
-  return orders.filter(o => !o.tags.some(t => t.startsWith('dhg-status-')));
+  return orders;
+}
+
+function currentDhgStatus(order) {
+  const tag = order.tags.find(t => t.startsWith('dhg-status-'));
+  return tag ? tag.replace('dhg-status-', '') : null;
+}
+
+// Orders manually placed on backorder (after a direct conversation with the
+// customer) are off-limits to all automated processing - no status changes,
+// no inventory-queued promotion, no emails. They opt back in only when a
+// human manually changes the tag.
+function isManuallyBackordered(order) {
+  return order.tags.some(t => t === 'dhg-status-backorder');
 }
 
 // ── Tag order ──────────────────────────────────────────────────────────────
@@ -181,19 +291,16 @@ function sortOldestFirst(orders) {
   return [...orders].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 }
 
-function determineStatus(order, availableQty) {
-  if (hasPreorderItem(order)) return { status: 'preorder', sendEmail: true };
-
-  if (allItemsCoveredByBins(order, availableQty)) {
-    deductFromBins(order, availableQty);
-    return { status: 'inventory-queued', sendEmail: true };
-  }
-
+// Decides the FIRST status for a brand-new (untagged) order. This is only
+// ever called for orders that did NOT qualify for the inventory-queued
+// shortcut, so inventory-queued is intentionally absent from this priority list.
+function decideInitialStatus(order) {
+  if (hasPreorderItem(order)) return 'preorder';
   if (isFirstTimeCustomer(order)) {
     const isShop = order.channelInformation?.channelDefinition?.handle === 'shop';
-    return { status: isShop ? 'shop-first-order' : 'store-first-order', sendEmail: true };
+    return isShop ? 'shop-first-order' : 'store-first-order';
   }
-  return { status: 'order-placed', sendEmail: false };
+  return 'order-placed';
 }
 
 // ── Email templates ────────────────────────────────────────────────────────
@@ -356,37 +463,86 @@ export default async function handler(req, res) {
 
   try {
     console.log(`DHG cron triggered at ${new Date().toISOString()}`);
-    const orders = await getUntaggedOrders();
-    console.log(`Found ${orders.length} untagged orders`);
-
-    const sortedOrders = sortOldestFirst(orders);
-    const availableQty = await getBinQuantities();
     const dryRun = req.query.dryRun === '1';
 
+    const orders = await getOrdersInScope();
+    console.log(`Found ${orders.length} unfulfilled orders in the last 30 days`);
+
+    // Oldest-first so limited bin stock goes to whoever's been waiting longest
+    const sortedOrders = sortOldestFirst(orders);
+    const availableQty = await getBinQuantities();
+    const emailHistory = await loadEmailHistory();
+
     const results = [];
+
     for (const order of sortedOrders) {
       try {
-        const { status, sendEmail: shouldEmail } = determineStatus(order, availableQty);
+        if (isManuallyBackordered(order)) {
+          results.push({ order: order.name, status: 'backorder', skipped: true, reason: 'Manually backordered - excluded from automation', success: true });
+          continue;
+        }
 
-        if (!dryRun) {
-          await tagOrder(order.id, status, order.tags);
+        const current = currentDhgStatus(order);
+        const alreadySent = emailHistory.get(order.name) || new Set();
+
+        let newStatus = current;
+        let isNewlyTagged = false;
+
+        // Step 1: inventory-queued shortcut - checked for EVERY order, tagged or not.
+        // If it qualifies, this skips the rest of the flow entirely for this order.
+        if (allItemsCoveredByBins(order, availableQty)) {
+          deductFromBins(order, availableQty);
+          if (current !== 'inventory-queued') {
+            newStatus = 'inventory-queued';
+            isNewlyTagged = true;
+          }
+        } else if (!current) {
+          // Step 2a: brand-new untagged order - decide its first status
+          newStatus = decideInitialStatus(order);
+          isNewlyTagged = true;
+        }
+        // Step 2b: already-tagged order, didn't qualify for inventory-queued -
+        // newStatus stays equal to current; we just check email history below.
+
+        if (isNewlyTagged && !dryRun) {
+          await tagOrder(order.id, newStatus, order.tags);
         }
 
         let emailResult = { skipped: true };
-        if (shouldEmail && order.email && !dryRun) {
-          emailResult = await sendEmail(status, {
+        const needsEmail = newStatus && EMAIL_STATUSES.has(newStatus) && !alreadySent.has(newStatus);
+
+        if (needsEmail && order.email && !dryRun) {
+          emailResult = await sendEmail(newStatus, {
             email: order.email,
             firstName: order.customer?.firstName || '',
             orderNumber: order.name,
           });
+          if (!emailResult.skipped) {
+            alreadySent.add(newStatus);
+            emailHistory.set(order.name, alreadySent);
+          }
+        } else if (needsEmail && dryRun) {
+          // In dry-run, report what WOULD be sent without actually sending or recording it
+          emailResult = { skipped: false, dryRun: true };
         }
 
-        console.log(`${order.name} → dhg-status-${status} | email: ${!emailResult.skipped}`);
-        results.push({ order: order.name, status, emailSent: !emailResult.skipped, success: true });
+        console.log(`${order.name}: ${current || '(none)'} → ${newStatus} | email sent: ${!emailResult.skipped}`);
+        results.push({
+          order: order.name,
+          previousStatus: current,
+          newStatus,
+          newlyTagged: isNewlyTagged,
+          emailSent: !emailResult.skipped,
+          success: true,
+        });
       } catch (err) {
         console.error(`Error on ${order.name}:`, err.message);
         results.push({ order: order.name, error: err.message, success: false });
       }
+    }
+
+    if (!dryRun) {
+      await saveEmailHistory(emailHistory);
     }
 
     return res.status(200).json({
