@@ -8,6 +8,67 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const FROM_EMAIL = 'hello@detectivehawkgames.com';
 const FROM_NAME = 'Detective Hawk Games';
 const ORDER_LOOKUP_URL = 'https://detectivehawkgames.com/pages/order-lookup';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const NOTIFY_EMAIL = 'iain@detectivehawkgames.com';
+
+async function generateThankYouCardCopy(firstName, lineItems) {
+  const itemsList = lineItems.map(li => `${li.title} (x${li.quantity})`).join(', ');
+  const prompt = `You are writing thank-you card copy for Detective Hawk Games, a board game store. A first-time customer named ${firstName} just had their order queued for shipping. Their order contains: ${itemsList}.
+
+Write ONE punchy sentence (under 20 words) about their order, grouping items by theme/franchise where relevant (e.g. "Arkham Horror LCG", "Star Wars Imperial Assault"). Warm, genuine tone. You may mention specific product titles to help distinguish cards when customers share a first name. Do NOT include any greeting, "thank you", or sign-off - those are already printed on the card. Output ONLY the one sentence, nothing else.`;
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!res.ok) {
+    console.error('Anthropic API error:', res.status, await res.text());
+    return '(Could not generate card copy - write manually)';
+  }
+  const data = await res.json();
+  return data.content?.[0]?.text?.trim() || '(Could not generate card copy - write manually)';
+}
+
+async function sendInternalNotification(inventoryQueuedOrders, thankYouCards) {
+  if (!inventoryQueuedOrders.length) return;
+
+  let html = `<h2>Orders moved to Inventory Queued</h2><p>These orders had every item covered by current bin stock. Go pack them!</p><ul>`;
+  for (const o of inventoryQueuedOrders) {
+    html += `<li><strong>${o.orderNumber}</strong></li>`;
+  }
+  html += `</ul>`;
+
+  if (thankYouCards.length) {
+    html += `<h2>Thank-You Card Copy</h2><p>First-time shipments in this batch - here's the card copy to write:</p>`;
+    for (const card of thankYouCards) {
+      html += `<p><strong>${card.firstName}</strong> (Order ${card.orderNumber})<br>${card.copy}</p>`;
+    }
+  }
+
+  try {
+    await sendViaResend({
+      from: `${FROM_NAME} <${FROM_EMAIL}>`,
+      to: [NOTIFY_EMAIL],
+      subject: `${inventoryQueuedOrders.length} order(s) ready to pack - Inventory Queued`,
+      html,
+    });
+  } catch (err) {
+    // This is the internal digest, not a customer email - if it fails, log it
+    // loudly so the failure is visible in Vercel's function logs rather than
+    // silently disappearing, since there's no other record of this attempt.
+    console.error('Internal notification email FAILED to send:', err.message);
+  }
+}
 const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -439,19 +500,46 @@ function getEmailTemplate(status, { firstName, orderNumber } = {}) {
 // ── Send email via Resend ──────────────────────────────────────────────────
 const EMAIL_STATUSES = new Set(['store-first-order','shop-first-order','order-supplier','order-received','inventory-queued','preorder','order-delayed']);
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Resend's default rate limit is 2 requests/second. A cron run can easily need
+// to send several emails in the same pass (customer emails + the internal
+// digest), so every call goes through this wrapper: a small delay before each
+// send, and one retry with backoff if we still get rate-limited.
+async function sendViaResend(payload) {
+  await sleep(550); // keep us comfortably under 2 req/sec
+
+  let res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (res.status === 429) {
+    console.warn('Resend rate limit hit, retrying after backoff...');
+    await sleep(1500);
+    res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  if (!res.ok) throw new Error(`Resend failed: ${res.status} ${await res.text()}`);
+  return await res.json();
+}
+
 async function sendEmail(status, { email, firstName, orderNumber }) {
   if (!EMAIL_STATUSES.has(status) || !email) return { skipped: true };
   const template = getEmailTemplate(status, { firstName, orderNumber });
   if (!template) return { skipped: true };
 
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to: [email], subject: template.subject, html: template.html }),
+  return await sendViaResend({
+    from: `${FROM_NAME} <${FROM_EMAIL}>`,
+    to: [email],
+    subject: template.subject,
+    html: template.html,
   });
-
-  if (!res.ok) throw new Error(`Resend failed: ${res.status} ${await res.text()}`);
-  return await res.json();
 }
 
 // ── Main handler ───────────────────────────────────────────────────────────
@@ -474,6 +562,8 @@ export default async function handler(req, res) {
     const emailHistory = await loadEmailHistory();
 
     const results = [];
+    const newlyInventoryQueued = [];
+    const thankYouCards = [];
 
     for (const order of sortedOrders) {
       try {
@@ -495,6 +585,20 @@ export default async function handler(req, res) {
           if (current !== 'inventory-queued') {
             newStatus = 'inventory-queued';
             isNewlyTagged = true;
+            newlyInventoryQueued.push({ orderNumber: order.name });
+
+            if (isFirstShipment(order)) {
+              const lineItems = order.lineItems.edges.map(e => ({
+                title: e.node.title,
+                quantity: e.node.quantity,
+              }));
+              const copy = await generateThankYouCardCopy(order.customer?.firstName || 'there', lineItems);
+              thankYouCards.push({
+                firstName: order.customer?.firstName || 'there',
+                orderNumber: order.name,
+                copy,
+              });
+            }
           }
         } else if (!current) {
           // Step 2a: brand-new untagged order - decide its first status
@@ -543,10 +647,14 @@ export default async function handler(req, res) {
 
     if (!dryRun) {
       await saveEmailHistory(emailHistory);
+      await sendInternalNotification(newlyInventoryQueued, thankYouCards);
     }
 
     return res.status(200).json({
       message: `Processed ${results.length} orders.`,
+      inventoryQueuedCount: newlyInventoryQueued.length,
+      thankYouCardsGenerated: thankYouCards.length,
+      thankYouCards: dryRun ? thankYouCards : undefined,
       results,
     });
 
