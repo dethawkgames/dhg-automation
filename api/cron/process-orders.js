@@ -51,7 +51,10 @@ async function sendInternalNotification(inventoryQueuedOrders, thankYouCards) {
   if (thankYouCards.length) {
     html += `<h2>Thank-You Card Copy</h2><p>First-time shipments in this batch - here's the card copy to write:</p>`;
     for (const card of thankYouCards) {
-      html += `<p><strong>${card.firstName}</strong> (Order ${card.orderNumber})<br>${card.copy}</p>`;
+      const nameLine = card.namesMatch
+        ? `<strong>${card.recipientName}</strong>`
+        : `<strong>${card.recipientName}</strong> (account holder: ${card.accountHolderName} - looks like a gift, address the card to ${card.recipientName})`;
+      html += `<p>${nameLine} (Order ${card.orderNumber})<br>${card.copy}</p>`;
     }
   }
 
@@ -222,11 +225,12 @@ async function getOrdersInScope() {
               id name email tags createdAt
               channelInformation { channelDefinition { handle } }
               customer {
-                id firstName numberOfOrders
+                id firstName lastName numberOfOrders
                 orders(first: 50) {
                   edges { node { id displayFulfillmentStatus } }
                 }
               }
+              shippingAddress { firstName lastName }
               lineItems(first: 50) {
                 edges {
                   node {
@@ -592,9 +596,20 @@ export default async function handler(req, res) {
                 title: e.node.title,
                 quantity: e.node.quantity,
               }));
-              const copy = await generateThankYouCardCopy(order.customer?.firstName || 'there', lineItems);
+              const accountHolderName = order.customer?.firstName || 'there';
+              const shipFirst = order.shippingAddress?.firstName;
+              const shipLast = order.shippingAddress?.lastName;
+              const recipientName = shipFirst || accountHolderName;
+              // Compare first+last together, not just first name, since two
+              // different people can share a first name coincidentally.
+              const namesMatch = !shipFirst ||
+                (shipFirst === order.customer?.firstName && shipLast === order.customer?.lastName);
+
+              const copy = await generateThankYouCardCopy(recipientName, lineItems);
               thankYouCards.push({
-                firstName: order.customer?.firstName || 'there',
+                accountHolderName,
+                recipientName,
+                namesMatch,
                 orderNumber: order.name,
                 copy,
               });
