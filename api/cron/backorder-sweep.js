@@ -258,7 +258,8 @@ async function loadSupplierData() {
     }
   }
 
-  const garlandRows = await sheetsGet(SKUS_SHEET_ID, 'Garland!A3:H');
+  // Garland (ACDD): header is row 1 (see same fix in aggregate-supplier-orders.js)
+  const garlandRows = await sheetsGet(SKUS_SHEET_ID, 'Garland!A1:H');
   const garlandHeader = garlandRows[0];
   const garlandData = rowsToObjects([garlandHeader, ...garlandRows.slice(1)]);
   const garlandByItemId = new Map();
