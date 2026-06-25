@@ -227,41 +227,46 @@ async function loadSupplierData() {
     if (sku) bySku.set(sku, row);
   }
 
-  const asmodeeRows = await sheetsGet(SKUS_SHEET_ID, "'APS - US Only'!A2:G");
-  const asmodeeHeader = asmodeeRows[0];
-  const asmodeeData = rowsToObjects([asmodeeHeader, ...asmodeeRows.slice(1)]);
+  // Same drift as aggregate-supplier-orders.js: Cowork migrated these tabs
+  // to plain "Asmodee"/"Alliance" names - detect header rows dynamically.
+  const asmodeeRaw = await sheetsGet(SKUS_SHEET_ID, "'Asmodee'!A1:J20");
+  const asmodeeHeaderRowIdx = asmodeeRaw.findIndex(row => row[0] === 'Code');
+  if (asmodeeHeaderRowIdx === -1) {
+    throw new Error('Could not find Asmodee tab header row');
+  }
+  const asmodeeAllRows = await sheetsGet(SKUS_SHEET_ID, `'Asmodee'!A${asmodeeHeaderRowIdx + 1}:J`);
+  const asmodeeHeader = asmodeeAllRows[0];
+  const asmodeeData = rowsToObjects([asmodeeHeader, ...asmodeeAllRows.slice(1)]);
   const asmodeeByCode = new Map();
   for (const row of asmodeeData) {
     const code = row['Code']?.trim();
     if (code) asmodeeByCode.set(code, row);
   }
 
-  const metaToken = await getGoogleToken();
-  const metaRes = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SKUS_SHEET_ID}?fields=sheets.properties.title`,
-    { headers: { 'Authorization': `Bearer ${metaToken}` } }
-  );
-  const metaData = await metaRes.json();
-  const sheetTitles = metaData.sheets.map(s => s.properties.title);
-  const invExportTab = sheetTitles
-    .filter(t => t.startsWith('Inventory_Export_'))
-    .sort()
-    .reverse()[0];
-
+  const udRaw = await sheetsGet(SKUS_SHEET_ID, "'Alliance'!A1:N20");
+  const udHeaderRowIdx = udRaw.findIndex(row => row[0] === 'Category Name');
+  if (udHeaderRowIdx === -1) {
+    throw new Error('Could not find Alliance tab header row');
+  }
+  const udAllRows = await sheetsGet(SKUS_SHEET_ID, `'Alliance'!A${udHeaderRowIdx + 1}:N`);
+  const udHeader = udAllRows[0];
+  const udData = rowsToObjects([udHeader, ...udAllRows.slice(1)]);
   let universalByVendorItem = new Map();
-  if (invExportTab) {
-    const udRows = await sheetsGet(SKUS_SHEET_ID, `'${invExportTab}'!A1:J`);
-    const udData = rowsToObjects(udRows);
-    for (const row of udData) {
-      const vendorItem = row['Vendor Item No.']?.trim();
-      if (vendorItem) universalByVendorItem.set(vendorItem, row);
-    }
+  for (const row of udData) {
+    const vendorItem = row['Vendor Item No.']?.trim();
+    if (vendorItem) universalByVendorItem.set(vendorItem, row);
   }
 
-  // Garland (ACDD): header is row 1 (see same fix in aggregate-supplier-orders.js)
-  const garlandRows = await sheetsGet(SKUS_SHEET_ID, 'Garland!A1:H');
-  const garlandHeader = garlandRows[0];
-  const garlandData = rowsToObjects([garlandHeader, ...garlandRows.slice(1)]);
+  // Garland (ACDD): header row position isn't stable - see same fix in
+  // aggregate-supplier-orders.js. Detect it instead of hardcoding a row.
+  const garlandRaw = await sheetsGet(SKUS_SHEET_ID, 'Garland!A1:H20');
+  const garlandHeaderRowIdx = garlandRaw.findIndex(row => row[0] === 'ItemID');
+  if (garlandHeaderRowIdx === -1) {
+    throw new Error('Could not find Garland tab header row (looked for "ItemID" in column A within the first 20 rows)');
+  }
+  const garlandAllRows = await sheetsGet(SKUS_SHEET_ID, `Garland!A${garlandHeaderRowIdx + 1}:H`);
+  const garlandHeader = garlandAllRows[0];
+  const garlandData = rowsToObjects([garlandHeader, ...garlandAllRows.slice(1)]);
   const garlandByItemId = new Map();
   for (const row of garlandData) {
     const itemId = row['ItemID']?.trim();
