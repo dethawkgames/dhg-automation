@@ -10,10 +10,12 @@
 // scan covers, so this sweep can't just wait for Monday to pick them up
 // naturally. Instead: anything found newly available gets written to a
 // "Newly Available Backorders" tab that Monday's aggregation tool reads IN
-// ADDITION to its normal scan, and the order's dhg-status tag flips from
-// backorder to order-supplier so it re-enters normal automated processing
-// (process-orders.js will then handle inventory-queued promotion / emails
-// for it like any other order-supplier order).
+// ADDITION to its normal scan, and an email digest goes out flagging which
+// orders to verify. The order's dhg-status tag is deliberately NOT changed
+// here - this availability check has produced false positives (supplier
+// sites showed the item as genuinely unavailable despite passing this
+// check), so Iain confirms availability himself on the actual supplier
+// site(s) and retags backorder -> order-supplier manually.
 //
 // A backorder only clears once EVERY line item on it is available somewhere
 // - a partially-available backorder stays tagged backorder and isn't
@@ -356,8 +358,8 @@ async function sendViaResend(payload) {
 async function sendDigest(resolvedOrders) {
   if (!resolvedOrders.length) return;
 
-  let html = `<h2>${resolvedOrders.length} backordered order(s) now have availability</h2>`;
-  html += `<p>Re-tagged from backorder to order-supplier and added to the "Newly Available Backorders" tab for Monday's supplier aggregation.</p><ul>`;
+  let html = `<h2>${resolvedOrders.length} backordered order(s) may now have availability - please verify</h2>`;
+  html += `<p>This availability check has produced false positives before, so these orders are still tagged backorder. Please confirm on the actual supplier site(s) before retagging to order-supplier yourself.</p><ul>`;
   for (const o of resolvedOrders) {
     const itemsStr = o.items.map(i => `${i.title} (${i.sku}) x${i.quantity} - ${i.supplierLabel}`).join('; ');
     html += `<li><strong>${o.orderName}</strong>: ${itemsStr}</li>`;
@@ -368,7 +370,7 @@ async function sendDigest(resolvedOrders) {
     await sendViaResend({
       from: `${FROM_NAME} <${FROM_EMAIL}>`,
       to: [NOTIFY_EMAIL],
-      subject: `${resolvedOrders.length} backordered order(s) now available - Backorder Sweep`,
+      subject: `${resolvedOrders.length} backordered order(s) to verify - Backorder Sweep`,
       html,
     });
   } catch (err) {
@@ -441,10 +443,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // Re-tag resolved orders so they re-enter normal automated processing
-    for (const o of resolvedOrders) {
-      await tagOrder(o.orderId, 'order-supplier', o.tags);
-    }
+    // NOTE: we deliberately do NOT auto-retag resolved orders anymore. The
+    // availability check here has produced false positives (supplier sites
+    // showed the item as genuinely unavailable despite this sweep flagging
+    // it as resolved), so orders stay tagged dhg-status-backorder and Iain
+    // reviews + retags manually after confirming availability himself.
 
     // Append (not overwrite) to Newly Available Backorders - Monday's
     // aggregation tool clears it after consuming, but if this sweep ever
