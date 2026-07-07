@@ -21,6 +21,13 @@
 // - a partially-available backorder stays tagged backorder and isn't
 // reported, since flipping the order's status early would let
 // process-orders.js treat it as fully actionable when it isn't.
+//
+// Cancelled orders are excluded from the scan entirely: a cancelled order
+// can still show fulfillment_status:unfulfilled (nothing was ever
+// fulfilled), so without -status:cancelled a cancelled backorder would get
+// checked for availability, potentially land in the Newly Available
+// Backorders tab, and prompt Iain to verify/reorder something that no
+// longer needs to exist.
 
 import jwt from 'jsonwebtoken';
 
@@ -46,6 +53,7 @@ const GOOGLE_SA_PRIVATE_KEY_VAR = () => {
 };
 
 // ── Shopify auth ─────────────────────────────────────────────────────────────
+
 let _token = null;
 let _tokenExpiresAt = 0;
 
@@ -84,11 +92,10 @@ async function getBackorderedOrders() {
   let orders = [];
   let cursor = null;
   let hasNextPage = true;
-
   while (hasNextPage) {
     const data = await graphql(`
       query getOrders($cursor: String) {
-        orders(first: 50, after: $cursor, query: "tag:'dhg-status-backorder' fulfillment_status:unfulfilled") {
+        orders(first: 50, after: $cursor, query: "tag:'dhg-status-backorder' fulfillment_status:unfulfilled -status:cancelled") {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
@@ -100,6 +107,7 @@ async function getBackorderedOrders() {
                   node {
                     title
                     quantity
+                    currentQuantity
                     sku
                     product { id }
                   }
@@ -110,12 +118,10 @@ async function getBackorderedOrders() {
         }
       }
     `, { cursor });
-
     orders = orders.concat(data.orders.edges.map(e => e.node));
     hasNextPage = data.orders.pageInfo.hasNextPage;
     cursor = data.orders.pageInfo.endCursor;
   }
-
   return orders;
 }
 
@@ -133,6 +139,7 @@ async function tagOrder(orderId, status, existingTags) {
 }
 
 // ── Google Sheets auth + access ─────────────────────────────────────────────
+
 async function getGoogleToken() {
   const token = jwt.sign(
     { scope: 'https://www.googleapis.com/auth/spreadsheets' },
@@ -199,7 +206,6 @@ async function ensureBackorderTabExists() {
   const meta = await metaRes.json();
   const titles = meta.sheets.map(s => s.properties.title);
   if (titles.includes(BACKORDER_TAB)) return;
-
   await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${AGG_SHEET_ID}:batchUpdate`,
     {
@@ -211,6 +217,7 @@ async function ensureBackorderTabExists() {
 }
 
 // ── Supplier lookup data (same decision tree as Supplier Order Aggregation) ──
+
 function rowsToObjects(rows) {
   const [header, ...rest] = rows;
   return rest.map(row => {
@@ -284,7 +291,6 @@ function decideSupplier(sku, sheetData) {
   const skuRow = sheetData.bySku.get(sku);
   const tags = (skuRow?.['Tags'] || '').toLowerCase();
   const acddSku = skuRow?.['ACDD SKU']?.trim();
-
   const hasAsmodee = tags.includes('asmodee');
   const hasAlliance = tags.includes('alliance');
 
@@ -319,6 +325,7 @@ function decideSupplier(sku, sheetData) {
 }
 
 // ── Bin tracker check ────────────────────────────────────────────────────────
+
 async function getBinQuantities() {
   const res = await fetch(`${BIN_TRACKER_URL}/api/bins`);
   if (!res.ok) throw new Error(`Bin tracker fetch failed: ${res.status}`);
@@ -334,6 +341,7 @@ async function getBinQuantities() {
 }
 
 // ── Email digest ─────────────────────────────────────────────────────────────
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendViaResend(payload) {
@@ -357,7 +365,6 @@ async function sendViaResend(payload) {
 
 async function sendDigest(resolvedOrders) {
   if (!resolvedOrders.length) return;
-
   let html = `<h2>${resolvedOrders.length} backordered order(s) may now have availability - please verify</h2>`;
   html += `<p>This availability check has produced false positives before, so these orders are still tagged backorder. Please confirm on the actual supplier site(s) before retagging to order-supplier yourself.</p><ul>`;
   for (const o of resolvedOrders) {
@@ -365,7 +372,6 @@ async function sendDigest(resolvedOrders) {
     html += `<li><strong>${o.orderName}</strong>: ${itemsStr}</li>`;
   }
   html += `</ul>`;
-
   try {
     await sendViaResend({
       from: `${FROM_NAME} <${FROM_EMAIL}>`,
@@ -387,6 +393,7 @@ function supplierLabel(decision, inBins) {
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
+
 export default async function handler(req, res) {
   const auth = req.headers['authorization'];
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -413,17 +420,21 @@ export default async function handler(req, res) {
         const sku = item.sku?.trim();
         if (!sku) { allAvailable = false; continue; }
 
+        // currentQuantity reflects what's actually still owed after any
+        // refunds/edits - a refunded item needs no supplier check at all and
+        // shouldn't block the rest of the order from clearing backorder status.
+        const qty = item.currentQuantity;
+        if (!qty || qty <= 0) continue;
+
         const productId = item.product?.id;
         const binQty = productId ? (binQuantities.get(productId) || 0) : 0;
-        const inBins = binQty >= item.quantity;
-
+        const inBins = binQty >= qty;
         const decision = inBins ? { supplier: 'bins' } : decideSupplier(sku, sheetData);
         const available = inBins || decision.supplier != null;
-
         if (!available) allAvailable = false;
 
         lineResults.push({
-          sku, title: item.title, quantity: item.quantity,
+          sku, title: item.title, quantity: qty,
           supplierLabel: supplierLabel(decision, inBins),
           decision, inBins,
         });
@@ -472,7 +483,6 @@ export default async function handler(req, res) {
       stillBackorderedCount: stillBackordered.length,
       stillBackordered,
     });
-
   } catch (err) {
     console.error('Backorder sweep failed:', err);
     return res.status(500).json({ error: err.message, stack: err.stack });
