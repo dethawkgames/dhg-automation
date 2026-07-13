@@ -224,6 +224,7 @@ async function getOrdersInScope() {
           edges {
             node {
               id name email tags createdAt
+              incomingItems: metafield(namespace: "dhg", key: "incoming_items") { value }
               channelInformation { channelDefinition { handle } }
               customer {
                 id firstName lastName numberOfOrders
@@ -412,7 +413,7 @@ p{margin:0 0 14px}
 </body></html>`;
 }
 
-function getEmailTemplate(status, { firstName, orderNumber } = {}) {
+function getEmailTemplate(status, { firstName, orderNumber, items } = {}) {
   const name = firstName || 'there';
   const order = orderNumber || '';
   switch (status) {
@@ -491,6 +492,18 @@ function getEmailTemplate(status, { firstName, orderNumber } = {}) {
 <p>Detective Hawk Games</p>
 `)
     };
+    case 'items-incoming': return {
+      subject: 'Detective Hawk Games Order Update',
+      html: baseTemplate(`
+<h1>Detective Hawk Games Order Update</h1>
+<p>Hi ${name},</p>
+<p>Good news on <strong>Order # ${order}</strong> - we're getting <strong>${items || 'your outstanding item(s)'}</strong> in from our supplier this week, and that's the last thing your order was waiting on.</p>
+<p>Once it arrives here, we'll get your complete order packed up and shipped out to you.</p>
+<p>You will get another email once we have received it here.</p>
+<p>Let us know if you have any questions!</p>
+<p>Best,<br>Detective Hawk Games</p>
+`)
+    };
     case 'order-delayed': return {
       subject: 'DHG Order Update',
       html: baseTemplate(`
@@ -512,7 +525,7 @@ function getEmailTemplate(status, { firstName, orderNumber } = {}) {
 
 // ── Send email via Resend ──────────────────────────────────────────────────
 
-const EMAIL_STATUSES = new Set(['store-first-order','shop-first-order','order-supplier','order-received','inventory-queued','preorder','order-delayed']);
+const EMAIL_STATUSES = new Set(['store-first-order','shop-first-order','order-supplier','order-received','inventory-queued','preorder','order-delayed','items-incoming']);
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -540,9 +553,9 @@ async function sendViaResend(payload) {
   return await res.json();
 }
 
-async function sendEmail(status, { email, firstName, orderNumber }) {
+async function sendEmail(status, { email, firstName, orderNumber, items }) {
   if (!EMAIL_STATUSES.has(status) || !email) return { skipped: true };
-  const template = getEmailTemplate(status, { firstName, orderNumber });
+  const template = getEmailTemplate(status, { firstName, orderNumber, items });
   if (!template) return { skipped: true };
   return await sendViaResend({
     from: `${FROM_NAME} <${FROM_EMAIL}>`,
@@ -639,6 +652,7 @@ export default async function handler(req, res) {
             email: order.email,
             firstName: order.customer?.firstName || '',
             orderNumber: order.name,
+            items: order.incomingItems?.value,
           });
           if (!emailResult.skipped) {
             alreadySent.add(newStatus);
