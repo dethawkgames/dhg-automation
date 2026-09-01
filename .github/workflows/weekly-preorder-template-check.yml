@@ -1,0 +1,46 @@
+name: Weekly Preorder Template Check
+
+# Runs every Friday morning (release days) and applies changes automatically:
+#   1. revert-expired-preorder-templates.js  — flips products back to default
+#      once their release date has passed
+#   2. apply-preorder-templates.js           — flips products onto the
+#      preorder template if they're tagged preorder, not yet released, and
+#      still sitting on default
+#
+# Both scripts run with --apply, so this makes live changes with no manual
+# review step. Full stdout/stderr for each run is visible in the Actions tab
+# under this workflow's run history if you ever want to check what happened.
+
+on:
+  schedule:
+    # 12:00 UTC = 8:00 AM ET during daylight saving (EDT, UTC-4).
+    # During standard time (EST, UTC-5) this becomes 7:00 AM ET.
+    # Adjust the cron value below if you want a fixed local time year-round.
+    - cron: '0 12 * * 5'
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+jobs:
+  preorder-template-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Revert expired preorder templates
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+        run: node scripts/revert-expired-preorder-templates.js --apply
+
+      - name: Apply preorder templates to upcoming preorders
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+        run: node scripts/apply-preorder-templates.js --apply
