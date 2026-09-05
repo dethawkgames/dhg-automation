@@ -42,6 +42,17 @@ async function graphql(query, variables = {}) {
   return data;
 }
 
+// Email-lifecycle tags mark which confirmation email was sent and are never
+// removed as the order moves through fulfillment (see dhg-asmodee-reconcile-app,
+// which excludes these same tags from its own "current stage" lookups). They
+// must not be mistaken for the order's current fulfillment stage.
+const EMAIL_LIFECYCLE_TAGS = [
+  'dhg-status-store-first-order',
+  'dhg-status-shop-first-order',
+  'dhg-status-order-placed',
+  'dhg-status-preorder',
+];
+
 const STATUS_LABELS = {
   'order-placed': { label: 'Order Placed', description: "We've received your order and are processing it." },
   'store-first-order': { label: 'Order Placed', description: "Welcome! We've received your first order and are processing it." },
@@ -96,8 +107,20 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'No order found with that order number and email combination.' });
     }
 
-    const statusTag = order.tags.find(t => t.startsWith('dhg-status-'));
-    const statusKey = statusTag ? statusTag.replace('dhg-status-', '') : null;
+    // The "shipped" stage tag (dhg-shipped-from-supplier) breaks the
+    // dhg-status- naming convention that every other fulfillment-stage tag
+    // uses, so it must be checked for explicitly. Fulfillment-stage tags take
+    // priority over email-lifecycle tags, which stick around after the order
+    // moves on and would otherwise be mistaken for the current status.
+    const fulfillmentTag = order.tags.find(t =>
+      t === 'dhg-shipped-from-supplier' ||
+      (t.startsWith('dhg-status-') && !EMAIL_LIFECYCLE_TAGS.includes(t))
+    );
+    const lifecycleTag = order.tags.find(t => EMAIL_LIFECYCLE_TAGS.includes(t));
+    const statusTag = fulfillmentTag || lifecycleTag;
+    const statusKey = statusTag
+      ? (statusTag === 'dhg-shipped-from-supplier' ? 'shipped-from-supplier' : statusTag.replace('dhg-status-', ''))
+      : null;
     const statusInfo = statusKey ? STATUS_LABELS[statusKey] : null;
 
     return res.status(200).json({
